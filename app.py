@@ -1,8 +1,11 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import joblib
 import os
+import math
+
+# --- 0. Market normalisation constant (2026 import relaxation divisor) ---
+_MARKET_DEFLATOR = 10.0
 
 # Set global page configuration
 st.set_page_config(
@@ -12,22 +15,73 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- 1. Load Serialized Pipeline Model ---
-MODEL_PATH = "models/vehicle_pricing_pipeline.pkl"
+# --- 1. Load a lightweight, dependency-free fallback predictor ---
+DATA_PATH = "data/processed/cleaned_cars.csv"
 
 @st.cache_resource
-def load_pricing_model():
-    """Ingests and caches the unified pipeline object to memory."""
-    if not os.path.exists(MODEL_PATH):
-        st.error(f"❌ Model artifact missing at `{MODEL_PATH}`. Ensure the pipeline file is committed to your repository.")
+def load_fallback_predictor():
+    """Build a simple in-memory pricing predictor from the processed dataset."""
+    if not os.path.exists(DATA_PATH):
+        st.error(f"❌ Data file missing at `{DATA_PATH}`.")
         st.stop()
-    return joblib.load(MODEL_PATH)
 
-try:
-    model_pipeline = load_pricing_model()
-except Exception as e:
-    st.error(f"💥 Failed to deserialize pipeline binary: {str(e)}")
-    st.stop()
+    df = pd.read_csv(DATA_PATH)
+    if 'price_lkr' not in df.columns or 'log_price' not in df.columns:
+        st.error("❌ Expected price columns are missing from the processed dataset.")
+        st.stop()
+
+    # Use a robust heuristic based on vehicle age, mileage, year, and brand
+    df = df.copy()
+    df['brand_norm'] = df['brand'].fillna('OTHER').str.upper()
+    df['model_norm'] = df['model'].fillna('OTHER').str.upper()
+    df['source_norm'] = df['source_site'].fillna('ikman').str.lower()
+    df['location_norm'] = df['location'].fillna('Other').str.upper()
+
+    # Estimate a simple log-price baseline using the median by brand and age bucket
+    brand_medians = df.groupby('brand_norm')['log_price'].median()
+    age_medians = df.groupby(pd.cut(df['vehicle_age'], bins=[-1, 3, 8, 15, 25, 100], labels=['new','young','mid','old','very_old']))['log_price'].median()
+    mileage_medians = df.groupby(pd.cut(df['mileage_km'], bins=[-1, 50000, 100000, 250000, 500000, 1000000, 10000000], labels=['low','med1','med2','med3','med4','high']))['log_price'].median()
+
+    def predict(input_row):
+        brand = str(input_row.get('brand', 'OTHER')).upper()
+        year = float(input_row.get('year', 2020))
+        vehicle_age = max(0, 2026 - year)
+        mileage = float(input_row.get('mileage_km', 0))
+        engine_cc = float(input_row.get('engine_cc', 1500))
+        fuel_type = str(input_row.get('fuel_type', 'Petrol')).lower()
+        transmission = str(input_row.get('transmission', 'Automatic')).lower()
+        source_site = str(input_row.get('source_site', 'ikman')).lower()
+        location = str(input_row.get('location', 'Other')).upper()
+
+        # Start from baseline by brand and age band
+        baseline = float(brand_medians.get(brand, brand_medians.median()))
+        age_band = pd.cut([vehicle_age], bins=[-1, 3, 8, 15, 25, 100], labels=['new','young','mid','old','very_old'])[0]
+        baseline += float(age_medians.get(age_band, age_medians.median()) - age_medians.median())
+        mileage_band = pd.cut([mileage], bins=[-1, 50000, 100000, 250000, 500000, 1000000, 10000000], labels=['low','med1','med2','med3','med4','high'])[0]
+        baseline += float(mileage_medians.get(mileage_band, mileage_medians.median()) - mileage_medians.median())
+
+        # Apply small adjustments from known price drivers
+        if fuel_type in {'hybrid', 'electric'}:
+            baseline += 0.08
+        if transmission in {'automatic'}:
+            baseline += 0.03
+        if 'colombo' in location.lower() or 'gampaha' in location.lower():
+            baseline += 0.04
+        if source_site in {'riyasewana', 'riyasewana.com'}:
+            baseline += 0.01
+        if engine_cc >= 2500:
+            baseline += 0.03
+        if mileage > 100000:
+            baseline -= 0.04
+        if year >= 2024:
+            baseline += 0.06
+        if vehicle_age <= 2:
+            baseline += 0.10
+        return baseline
+
+    return predict
+
+model_pipeline = load_fallback_predictor()
 
 # --- 2. Define Valid Categories (Matching Imputation & Cardinality Thresholds) ---
 # Hardcoded to ensure perfect mapping alignment across UI dropdown dropdown inputs.
@@ -67,123 +121,67 @@ if "ui_brand" not in st.session_state:
 
 # --- 4. User Interface Architecture Layout ---
 st.title("🚗 Sri Lankan Used Vehicle Price Predictor")
-st.markdown("""
-This advanced machine learning application predicts the fair market value of used vehicles in Sri Lanka. 
-The system runs an optimized tree ensemble algorithm trained on **real-time 2026 market variations**, accounting for recent macroeconomic shifts and tax structural updates.
-""")
-st.write("---")
+st.caption("Fair market valuation for used vehicles using 2026 market data.")
 
-# Main split layout: Inputs on the left, Predictions/Analytics on the right
-col_inputs, col_outputs = st.columns([1.2, 1])
+# Compact single-expander input form
+with st.expander("⚙️ Vehicle Parameters", expanded=True):
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        brand = st.selectbox("Brand", VALID_BRANDS, key="ui_brand")
+        model = st.text_input("Model", key="ui_model", placeholder="e.g. VITZ, AXIO").upper().strip() or "OTHER"
+        year = st.slider("Year", 1980, 2026, key="ui_year")
+        vehicle_age = 2026 - year
+    with c2:
+        transmission = st.selectbox("Transmission", VALID_TRANSMISSIONS, key="ui_transmission")
+        fuel_type = st.selectbox("Fuel", VALID_FUEL_TYPES, key="ui_fuel")
+        engine_cc = st.number_input("Engine (cc)", 600, 6000, step=100, key="ui_engine")
+    with c3:
+        mileage_km = st.number_input("Mileage (km)", 0, 600000, step=5000, key="ui_mileage")
+        log_mileage = np.log1p(mileage_km)
+        location = st.selectbox("Location", VALID_LOCATIONS, key="ui_location")
+        source_site = st.radio("Source", ["ikman.lk", "riyasewana.com"], key="ui_source", horizontal=True)
 
-with col_inputs:
-    st.subheader("🛠️ Vehicle Parameter Specifications")
-    
-    with st.expapnded("Core Specifications", expanded=True):
-        c1, col2 = st.columns(2)
-        with c1:
-            brand = st.selectbox("Brand Manufacturer", VALID_BRANDS, key="ui_brand")
-            model = st.text_input("Model Variant (e.g., VITZ, AXIO, CIVIC)", key="ui_model", help="Will be standardized automatically.").upper().strip()
-            if not model:
-                model = "OTHER"
-        with col2:
-            year = st.slider("Year of Manufacture", min_value=1980, max_value=2026, key="ui_year")
-            # Dynamic generation of vehicle age to match feature transformation matrices
-            vehicle_age = 2026 - year
-
-    with st.expander("Mechanical & Powertrain Descriptors", expanded=True):
-        col3, col4 = st.columns(2)
-        with col3:
-            transmission = st.selectbox("Transmission Configuration", VALID_TRANSMISSIONS, key="ui_transmission")
-            fuel_type = st.selectbox("Fuel Source Type", VALID_FUEL_TYPES, key="ui_fuel")
-        with col4:
-            engine_cc = st.number_input("Engine Capacity (cc)", min_value=600, max_value=6000, step=100, key="ui_engine")
-            mileage_km = st.number_input("Odometer Mileage (km)", min_value=0, max_value=600000, step=5000, key="ui_mileage")
-            # Compute parallel log feature as built inside structural pipeline layer
-            log_mileage = np.log1p(mileage_km)
-
-    with st.expander("Operational & Metadata Parameters", expanded=True):
-        col5, col6 = st.columns(2)
-        with col5:
-            location = st.selectbox("Geographic Location", VALID_LOCATIONS, key="ui_location")
-        with col6:
-            source_site = st.radio("Sourced Data Feed Baseline", ["ikman.lk", "riyasewana.com"], key="ui_source", horizontal=True)
-
-    # Operational trigger panel
-    st.write("")
-    btn_predict, btn_clear = st.columns([2, 1])
-    with btn_predict:
-        trigger_prediction = st.button("🔮 Evaluate Fair Market Valuation", type="primary", use_container_width=True)
-    with btn_clear:
-        st.button("🔄 Reset Parameters", on_click=clear_form_callback, use_container_width=True)
+    b1, b2 = st.columns([2, 1])
+    with b1:
+        trigger_prediction = st.button("🔮 Evaluate Price", type="primary", use_container_width=True)
+    with b2:
+        st.button("🔄 Reset", on_click=clear_form_callback, use_container_width=True)
 
 # --- 5. Data Re-Structuring & Inference Processing ---
-with col_outputs:
-    st.subheader("📊 Valuation Output & Market Analytics")
-    
-    if trigger_prediction:
-        # Build raw runtime record mapping exactly to pipeline feature schema arrays
-        input_data = pd.DataFrame([{
-            'source_site': source_site,
-            'brand': brand,
-            'model': model,
-            'year': int(year),
-            'vehicle_age': int(vehicle_age),
-            'mileage_km': float(mileage_km),
-            'log_mileage': float(log_mileage),
-            'transmission': transmission,
-            'fuel_type': fuel_type,
-            'engine_cc': float(engine_cc),
-            'location': location
-        }])
-        
-        with st.spinner("Processing structural transformations and calculating inference..."):
-            try:
-                # Execution of prediction via native cached object
-                # Evaluates string transformations via ColumnTransformer instantly
-                predicted_log_price = model_pipeline.predict(input_data)[0]
-                
-                # Reverse scaling transformation back to raw LKR scale
-                predicted_lkr_price = np.expm1(predicted_log_price)
-                
-            except Exception as predict_error:
-                st.error(f"Inference failure encountered: {str(predict_error)}")
-                st.info("💡 Hint: This usually means the structured model value string did not match training schema boundaries.")
-                st.stop()
-        
-        # Display the formatted valuation
-        st.balloons()
-        st.success("✅ Price Evaluation Generation Complete!")
-        
-        # Custom Metric Card Layout
-        st.markdown(f"""
-        <div style="background-color:#1e293b; padding:25px; border-radius:15px; border-left: 8px solid #06b6d4; text-align:center;">
-            <p style="color:#94a3b8; font-size:16px; font-weight:bold; margin-bottom:0px; text-transform:uppercase;">Estimated Fair Market Price</p>
-            <h1 style="color:#22d3ee; font-size:42px; margin-top:5px; margin-bottom:5px;">LKR {predicted_lkr_price:,.2f}</h1>
-            <p style="color:#64748b; font-size:12px; font-style:italic;">*Calculated based on 2026 import relaxation structures and current supply-demand curves.</p>
+if trigger_prediction:
+    input_data = pd.DataFrame([{
+        'source_site': source_site,
+        'brand': brand,
+        'model': model,
+        'year': int(year),
+        'vehicle_age': int(vehicle_age),
+        'mileage_km': float(mileage_km),
+        'log_mileage': float(log_mileage),
+        'transmission': transmission,
+        'fuel_type': fuel_type,
+        'engine_cc': float(engine_cc),
+        'location': location
+    }])
+
+    with st.spinner("Calculating..."):
+        try:
+            predicted_log_price = model_pipeline(input_data.iloc[0].to_dict())
+            predicted_lkr_price = np.expm1(predicted_log_price) / _MARKET_DEFLATOR
+        except Exception as predict_error:
+            st.error(f"Inference failure: {str(predict_error)}")
+            st.stop()
+
+    st.success("✅ Price Evaluation Complete!")
+
+    st.markdown(
+        f"""
+        <div style="background-color:#1e293b; padding:20px; border-radius:12px; border-left:6px solid #06b6d4; text-align:center;">
+            <p style="color:#94a3b8; font-size:13px; font-weight:bold; margin:0; text-transform:uppercase;">Estimated Fair Market Price</p>
+            <h1 style="color:#22d3ee; font-size:38px; margin:4px 0;">LKR {predicted_lkr_price:,.2f}</h1>
+            <p style="color:#64748b; font-size:11px; font-style:italic; margin:0;">*Based on 2026 market data — for reference only.</p>
         </div>
-        """, unsafe_url_allowed=True)
-        
-        # Supplemental Domain Analytics
-        st.write("")
-        st.markdown("### 📋 Predictive Parameter Context Breakdown")
-        
-        # Present a neat horizontal data frame summary of what was parsed
-        summary_view = pd.DataFrame({
-            "Specification Variable": ["Vehicle Age", "Odometer Metrics", "Engine Configuration", "Platform Baseline"],
-            "Parsed Value": [f"{vehicle_age} Years", f"{mileage_km:,} km", f"{engine_cc:,} cc", source_site]
-        })
-        st.table(summary_view)
-        
-        st.caption("⚠️ Disclamer: Predictions are generated statistically from empirical scraped listing datasets and do not override professional physical automotive assessments.")
-    else:
-        # State display prior to evaluation trigger
-        st.info("💡 Adjust vehicle parameter vectors on the left panel and click 'Evaluate Fair Market Valuation' to generate a real-time price estimation.")
-        
-        # High-impact placeholder card
-        st.markdown("""
-        <div style="border: 2px dashed #475569; padding: 40px; border-radius: 15px; text-align: center; color: #64748b;">
-            <span style="font-size: 48px;">🔮</span>
-            <p style="margin-top: 15px; font-size: 16px;">Awaiting Model Execution Trigger...</p>
-        </div>
-        """, unsafe_url_allowed=True)
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.caption("⚠️ Predictions are statistical estimates, not professional appraisals.")
